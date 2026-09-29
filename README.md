@@ -1,218 +1,252 @@
 # ai-ivr-jev
 
-Twilio ConversationRelay × TypeSafe AI (Jev) × OpenAI による、水まわり修理業者向けのハイブリッド音声自動応答サーバー。
+Twilio ConversationRelay × TypeSafe AI (Jev) × OpenAI で作る、水まわり修理業者向けの音声自動応答（IVR）サーバーです。
 
-- **Twilio ConversationRelay** が STT / TTS / 割り込み (barge-in) を担当し、サーバーとは WebSocket (JSON) で通信
-- **Jev** が毎ターン数百 ms で「意図・機器・症状・緊急度・有人要否」を判定し、コードが分岐を決める
-- 切り分け・聞き取り・復唱・緊急案内は **固定テンプレートを即返信**（LLM を通らない Fast Path）
-- 対処方法・料金などの **具体的な質問だけ GPT-4o-mini**（判定済みカテゴリのナレッジに絞る Deep Path）
-
-対応する業務: 水道（蛇口・キッチン・トイレ・お風呂・洗面台の水漏れ / 詰まり / 交換）、給湯器（ガス給湯器・電気温水器・エコキュートの故障 / 交換）、排水・下水（屋外排水・マスの詰まり、高圧洗浄）、水栓・トイレリフォーム（ウォシュレット取付、トイレ本体・洗面台交換）
+- 音声認識・音声合成・割り込みは **Twilio ConversationRelay** が担当（サーバーは WebSocket の JSON だけを扱う）
+- 意図・機器・症状・緊急度・「今の発話は質問への答えか」などの **判定は Jev**（1 ターン 1 リクエストで並列判定、約 250ms）
+- 切り分け・状況確認・日時や名前の聞き取り・復唱・緊急案内は **定型文で即返信**（LLM を通らない）
+- 対処方法の一言や「止水栓はどこ？」のような質問だけ **OpenAI (gpt-4o-mini)** が文章を生成。その間も Jev の判定が返った時点で「少々お調べします」「ありがとうございます」を先に話す
 
 ```
-発話 ─▶ Twilio STT ─▶ {"type":"prompt"} ─▶ Jev（1リクエストで並列判定: intent / is_confident / requires_human ＋ 状況に応じた追加質問）
-                                             │
-      requires_human ≥ 0.7 ─────────────────┼─▶ 有人転送  {"type":"end", handoffData}
-      待っていた答え (機器/症状/日時/名前/住所/はい・いいえ) ┼─▶ 次の質問へ進む / 受付完了     ← Fast Path
-      TROUBLE ──────────────────────────────┼─▶ 機器×症状で切り分け → 「キッチンの水漏れですね」＋状況確認の質問 (1〜2問, 定型) → OpenAI の一言 → 日時の質問
-      is_emergency ≥ 0.7 ───────────────────┼─▶ 応急処置の定型文 → 日時を飛ばして最短で受付        ← Fast Path
-      UNKNOWN or is_confident < 0.65 ───────┼─▶ 聞き返し（2回連続で有人転送）
-      KNOWLEDGE_FAQ ────────────────────────┼─▶ クッション発話 → カテゴリ別ナレッジ検索 → OpenAI → 回答 → 聞きかけの質問に戻る ← Deep Path
-      HUMAN_HANDOFF ────────────────────────┼─▶ 有人転送
-      CLOSING (「大丈夫です」) ───────────────┴─▶ お礼を述べて終話
+お客様: 給湯器が故障してて、お湯が出ないんです
+AI    : 給湯器の故障ですね。お湯はまったく出ませんか、それとも途中で止まりますか。
+お客様: 全然出ないです
+AI    : お風呂のリモコンにエラー番号は出ていますか。出ていれば番号を教えてください。
+お客様: 111 が出てます
+AI    : ありがとうございます。                                    ← Jev + 定型文（即時）
+        ガスの元栓が開いているか確認してください。リモコンの運転を   ← OpenAI（約 1 秒後）
+        一度切って入れ直すと改善することがあります。
+        それでは、点検と修理にお伺いします。お伺いする日にちと時間のご希望を教えてください。
+お客様: 明日の午前中
+AI    : 明日の午前中ですね。お名前を教えてください。
 ```
 
-## このデモのシナリオ
+対応する業務: 水道（蛇口・キッチン・トイレ・お風呂・洗面台の水漏れ / 詰まり / 交換）、給湯器（故障 / 交換）、排水・下水（屋外排水・マスの詰まり、高圧洗浄）、水栓・トイレリフォーム（ウォシュレット取付、トイレ本体・洗面台交換）。訪問の受付はモックで、実際の予約システムには登録しません。
 
-**水まわり修理業者の一次受付**を AI が担当します。お客様は電話番号にかけるか、ブラウザの「AI Call」ボタンで話しかけます。AI は次の順で応対し、人が出るのは有人転送のときだけです。
+## 目次
 
-1. **切り分け**（Jev）: 発話から機器（キッチン・トイレ・お風呂・給湯器…）と症状（水漏れ・詰まり・故障・交換・高圧洗浄）を判定し、「給湯器の故障ですね。」と復唱
-2. **状況確認**（Jev ＋ 定型文）: コールセンターのように 1〜2 問。「お湯はまったく出ませんか」「お風呂のリモコンにエラー番号は出ていますか」
-3. **一言アドバイス**（OpenAI）: 聞いた内容とナレッジ、発話されたエラーコードの意味をふまえて、今できる確認や応急処置を 60 文字以内で
-4. **訪問の受付**（Jev ＋ 定型文）: 日時 → 名前 → 住所 → 復唱 → 完了（登録はモック）
-5. 途中の質問（「止水栓はどこ」「いくらかかる」）には OpenAI が答えて、聞きかけの質問に戻る。緊急（水が止まらない等）は応急処置を先に案内して最短で受付。「大丈夫です」で終話
+1. [前提](#前提)
+2. [セットアップ](#セットアップ)
+3. [起動と動作確認](#起動と動作確認)
+4. [試してみるセリフ](#試してみるセリフ)
+5. [環境変数](#環境変数)
+6. [カスタマイズ](#カスタマイズ)
+7. [エンドポイント](#エンドポイント)
+8. [ログの見方](#ログの見方)
+9. [トラブルシューティング](#トラブルシューティング)
+10. [ディレクトリ構成](#ディレクトリ構成)
+11. [本番で動かす前に](#本番で動かす前に)
 
-### 試してみるセリフ
+## 前提
 
-| 話しかけ方 | 期待される流れ |
-| --- | --- |
-| 「給湯器が故障してお湯が出ない」→「全然出ない」→「**111** が出てます」 | 給湯器の故障ですね → 確認 2 問 → ありがとうございます。（OpenAI）点火不良の表示です。ガスの元栓を確認し、運転を入れ直してください → お伺いする日にちと時間は？ |
-| 「トイレが詰まった」→「ゆっくりなら流れる」→「心当たりはない」 | トイレの詰まりですね → 確認 2 問 → （OpenAI）水を流すのはやめてラバーカップを… → 日時の質問 |
-| 「水が止まらない、床が水浸し」→「お風呂です」 | **緊急**: まず止水栓か元栓を閉めてください → どちらの水漏れですか → お風呂の水漏れですね。できるだけ早くお伺いします。お名前は？（日時は聞かない） |
-| 「ウォシュレットを付けたい」→「コンセントはある」→「まだ買ってない」 | ウォシュレットの交換ですね → 確認 2 問 → （OpenAI）取り付けは約 1 時間、工事費は… → 日時の質問 |
-| 受付の途中で「止水栓ってどこですか」 | 少々お調べしますのでお待ちください（即時）→（OpenAI）トイレの止水栓はタンク横の… → 聞きかけの質問に戻る |
-| 「オペレーターにつないで」／ キーパッドの 0 | 有人転送（`HANDOFF_PHONE_NUMBER` 未設定ならお詫びして終了） |
+| 必要なもの | 用途 | 取得先 |
+| --- | --- | --- |
+| Node.js 20 以上（22 で動作確認） | サーバー | https://nodejs.org/ |
+| Twilio アカウント | 電話 / ConversationRelay / ブラウザ通話 | https://console.twilio.com/ |
+| TypeSafe AI の API キー | Jev による判定 | https://docs.typesafe.ai/ |
+| OpenAI の API キー | FAQ 回答と一言アドバイスの生成 | https://platform.openai.com/ |
+| ngrok の authtoken（ローカル開発時） | Twilio からローカルへ到達させるトンネル | https://dashboard.ngrok.com/get-started/your-authtoken |
 
-ブラウザ画面の右側「会話の内訳」で、各ターンが **Jev だけ（定型文）** か **Jev + OpenAI** か、Jev / OpenAI / サーバーの処理時間、体感の待ち時間が確認できます。
+Twilio 側で **ConversationRelay の利用同意**が必要です。Console の **Voice → Settings → General** で *Predictive and Generative AI/ML Features Addendum* に同意してください。同意していないと、つながってすぐ切れます。
+
+電話番号がなくても試せます。ブラウザの「AI Call」ボタンから同じ受付フローに発信できます（後述）。
 
 ## セットアップ
 
+### 1. 依存関係を入れる
+
 ```bash
+git clone https://github.com/MitsuharuNakamura/ivr-with-jev-twilio.git
+cd ivr-with-jev-twilio
 npm install
-cp .env.example .env      # TYPESAFE_API_KEY / OPENAI_API_KEY / TWILIO_ACCOUNT_SID を設定
+```
+
+### 2. Twilio で 3 つ用意する
+
+1. **Account SID と Auth Token**: Console のトップに表示されています。
+2. **API キー（Standard）**: Console → Account → API keys & tokens → Create API key。SID（`SK…`）と Secret を控えます（Secret は作成時しか見られません）。ブラウザ通話のトークン発行と、TwiML App の URL 自動更新に使います。
+3. **TwiML App**: Console → Voice → Manage → TwiML Apps → Create。名前は任意（例: `ai-ivr-jev`）。Voice Request URL は**空のままで構いません**（起動時にサーバーが自動で設定します）。SID（`AP…`）を控えます。
+
+電話番号からも受けたい場合は、その番号の **Phone Number SID**（`PN…`）も控えておきます（Console → Phone Numbers → 番号を開くと URL に含まれています）。
+
+### 3. `.env` を作る
+
+```bash
+cp .env.example .env
+```
+
+最低限、次を埋めます。
+
+```dotenv
+# ローカル開発: ngrok を内蔵で起動し、払い出された URL を Twilio に自動設定する
+NGROK_ENABLED=true
+NGROK_AUTHTOKEN=<ngrok の authtoken>
+
+TYPESAFE_API_KEY=<TypeSafe の API キー>
+OPENAI_API_KEY=<OpenAI の API キー>
+
+TWILIO_ACCOUNT_SID=AC...
+TWILIO_AUTH_TOKEN=<Auth Token>          # Twilio からのリクエスト署名を検証する
+TWILIO_API_KEY_SID=SK...
+TWILIO_API_KEY_SECRET=<API キーの Secret>
+TWILIO_TWIML_APP_SID=AP...
+
+# 電話番号からも受ける場合（任意）
+TWILIO_PHONE_NUMBER_SID=PN...
+```
+
+`.env` は `.gitignore` 済みです。コミットしないでください。
+
+### 4. テストが通ることを確認する
+
+```bash
+npm test
+```
+
+外部 API には接続しません（Jev / OpenAI / Twilio はすべてモック）。
+
+## 起動と動作確認
+
+```bash
 npm run dev
 ```
 
-### ngrok 内蔵（ローカル開発向け）
+起動すると次の順で進み、最後に `ready` が出ます。
 
-`.env` に `NGROK_ENABLED=true` と `NGROK_AUTHTOKEN` を設定すると、ngrok を別ターミナルで動かす必要はありません。
+1. ngrok のトンネルを開き、そのホスト名を公開ホストとして採用
+2. HTTP / WebSocket サーバーを起動
+3. Twilio の TwiML App（と `TWILIO_PHONE_NUMBER_SID` を設定した番号）の Voice URL を `https://<トンネル>/twiml` に更新
+4. `ready` ログに `twiml`（Twilio 用 URL）と `aiCall`（ブラウザ通話の URL）を表示
 
-1. サーバー起動時に ngrok トンネルを開く（ngrok の CLI は不要。`@ngrok/ngrok` を利用）
-2. 払い出された URL のホスト名を `PUBLIC_HOST` として採用（TwiML の `wss://…/relay` や署名検証に反映）
-3. Twilio REST API で **TwiML App の Voice URL を `https://<払い出しURL>/twiml` に更新**（`TWILIO_PHONE_NUMBER_SID` を設定すれば電話番号の Webhook も同時に更新）
-4. `Ctrl+C` / SIGTERM でサーバーを止めるとトンネルも閉じる
+```json
+{"msg":"ngrok tunnel open","url":"https://xxxx.ngrok-free.app"}
+{"msg":"Twilio voice webhook updated","kind":"TwiML App","voiceUrl":"https://xxxx.ngrok-free.app/twiml"}
+{"msg":"ready","twiml":"https://xxxx.ngrok-free.app/twiml","aiCall":"https://xxxx.ngrok-free.app/phone"}
+```
 
-起動ログの `ready` に `twiml` と `aiCall` (AI Call ボタンの URL) が出るので、それを開けばすぐ試せます。
+### ブラウザから通話する
 
-- Webhook 更新の認証は API キー (`TWILIO_API_KEY_SID` / `TWILIO_API_KEY_SECRET`) を優先し、無ければ `TWILIO_AUTH_TOKEN` を使います。
-- 更新に失敗してもサーバーは起動し続け、エラーログに手動設定すべき URL を出します。自動更新を止めるには `TWILIO_SYNC_WEBHOOKS=false`。
-- 停止時に Voice URL は元に戻しません（次回起動時に上書きされます）。無料プランは起動ごとに URL が変わるため、`NGROK_DOMAIN` に固定ドメインを設定すると安定します。
-- 本番など固定ホストで動かす場合は `NGROK_ENABLED=false`（既定）のまま `PUBLIC_HOST` を設定し、Twilio Console で電話番号の **A call comes in** を `https://<PUBLIC_HOST>/twiml` (HTTP POST) に設定します。
+`ready` ログの `aiCall` の URL（`https://<トンネル>/phone`）をブラウザで開き、「AI と通話する」を押します。
 
-ConversationRelay の利用には Console の Voice 設定で *Predictive and Generative AI/ML Features Addendum* への同意が必要です。
+- 無料プランの ngrok は初回に確認画面が出ます。「Visit Site」で進めます。
+- マイクの許可が求められます（HTTPS か localhost が必要）。
+- 画面右の「会話の内訳」に、ターンごとに **Jev だけ（定型文）か Jev + OpenAI か**のバッジ、Jev / OpenAI / サーバーの処理時間、体感の待ち時間（マイクが静かになってから AI の声が始まるまで。ヘッドホン推奨）が出ます。
+- 通話中の「オペレーターへ」ボタンで有人転送（DTMF 0）を試せます。
 
-### AI Call ボタン / ブラウザ通話（任意）
+### 電話番号から通話する
 
-電話番号は不要です。`/phone` の「AI と通話する」ボタンを押すだけで、ブラウザのマイクから同じ IVR ロジックと通話できます。
+`.env` に `TWILIO_PHONE_NUMBER_SID` を設定していれば、起動時にその番号の Voice URL も更新されます。設定していない場合は、Console → Phone Numbers → 番号 → Voice Configuration の *A call comes in* を `https://<トンネル>/twiml`（HTTP POST）に手で設定してください。
 
-1. Twilio Console → **Voice > TwiML Apps** で TwiML App を作成し、Voice Request URL を `https://<PUBLIC_HOST>/twiml` (POST) に設定
-2. **Account > API keys & tokens** で Standard API キーを作成
-3. `.env` に `TWILIO_API_KEY_SID` / `TWILIO_API_KEY_SECRET` / `TWILIO_TWIML_APP_SID` を設定して再起動（3つ揃ったときだけ機能が有効化されます）
-4. `https://<PUBLIC_HOST>/phone` を開いて「AI と通話する」（マイク利用のため HTTPS か localhost が必要）
+無料プランの ngrok は起動のたびに URL が変わります。毎回自動で更新されるので操作は不要ですが、固定したい場合は ngrok の Reserved Domain を取得して `NGROK_DOMAIN` に設定してください。
 
-ブラウザ → Twilio → TwiML App → `/twiml` → ConversationRelay → `/relay` と流れるため、PSTN 着信と完全に同じ経路・同じ判定ロジックで処理されます。通話中の「オペレーターへ」ボタンで有人転送 (DTMF 0) も試せます。
+### 停止する
 
-- トークン発行 `/phone/token` は誰でも叩けると **あなたの Twilio アカウントの課金で発信できてしまう** ため、`BROWSER_PHONE_PASSCODE` の設定を推奨します（`NODE_ENV=production` では必須）。発行トークンは発信専用 (outgoing grant のみ)・既定 1 時間有効で、発行は IP あたり 10 回/分に制限しています。
-- 画面右の「会話の内訳」には、ターンごとに **Jev だけで答えたか（定型文）／OpenAI が生成したか** のバッジと、Jev・OpenAI・サーバー全体の処理時間、さらに「体感」（ブラウザのマイクが静かになってから受話音声が始まるまで。ヘッドホン推奨）が出ます。仕組みは、発信時の `identity` を TwiML の `<Parameter>` で relay に渡し、サーバーがターンごとのイベントを `/phone/events`（SSE）で画面に流しています。
-- ブラウザ発信の `From` は `client:browser-xxxx` になり電話番号ではないため、有人転送の `<Dial>` を使う場合は `HANDOFF_CALLER_ID`（所有する Twilio 番号）を設定してください。
+`Ctrl+C` でサーバーとトンネルが閉じます。Twilio 側の Voice URL は元に戻しません（次回起動時に上書きされます）。
 
-| コマンド | 内容 |
+## 試してみるセリフ
+
+| 話しかけ方 | 期待される流れ |
 | --- | --- |
-| `npm run dev` | tsx watch で起動 |
-| `npm run build` / `npm start` | `dist/` にビルドして起動 |
-| `npm test` / `npm run test:coverage` | Vitest（カバレッジ閾値 80%） |
-| `npm run typecheck` | `tsc --noEmit` |
+| 「給湯器が故障してお湯が出ない」→「全然出ない」→「**111** が出てます」 | 給湯器の故障ですね → 確認 2 問 → ありがとうございます。（OpenAI）点火不良の対処 → お伺いする日にちと時間は？ |
+| 「トイレが詰まった」→「ゆっくりなら流れる」→「心当たりはない」 | トイレの詰まりですね → 確認 2 問 →（OpenAI）水を流すのはやめてラバーカップを… → 日時の質問 |
+| 「水が止まらない、床が水浸し」→「お風呂です」 | **緊急**: まず止水栓か元栓を閉めてください → どちらの水漏れですか → できるだけ早くお伺いします。お名前は？（日時は聞かない） |
+| 「ウォシュレットを付けたい」→「コンセントはある」→「まだ買ってない」 | ウォシュレットの交換ですね → 確認 2 問 →（OpenAI）取り付けは約 1 時間、工事費は… → 日時の質問 |
+| 受付の途中で「止水栓ってどこですか」 | 少々お調べしますのでお待ちください（即時）→（OpenAI）トイレの止水栓はタンク横の… → 聞きかけの質問に戻る |
+| 「オペレーターにつないで」／ キーパッドの 0 | 有人転送（`HANDOFF_PHONE_NUMBER` 未設定ならお詫びして終了） |
+| 「大丈夫です」「特にないです」 | お礼を述べて終話 |
+
+## 環境変数
+
+`.env.example` に全項目とコメントがあります。主なもの:
+
+### 必須
+
+| 変数 | 説明 |
+| --- | --- |
+| `TYPESAFE_API_KEY` | TypeSafe AI の API キー |
+| `OPENAI_API_KEY` | OpenAI の API キー |
+| `TWILIO_ACCOUNT_SID` | `AC…` |
+| `PUBLIC_HOST` または `NGROK_ENABLED=true` | Twilio から到達できるホスト名。ngrok 内蔵を使うなら `PUBLIC_HOST` は空でよい |
+
+### 公開ホスト / ngrok
+
+| 変数 | 既定 | 説明 |
+| --- | --- | --- |
+| `NGROK_ENABLED` | `false` | `true` で起動時にトンネルを開く。`NGROK_AUTHTOKEN` が必要 |
+| `NGROK_AUTHTOKEN` | — | ngrok の authtoken |
+| `NGROK_DOMAIN` | — | Reserved Domain を使う場合 |
+| `TWILIO_SYNC_WEBHOOKS` | `true` | 起動時に TwiML App / 電話番号の Voice URL を自動更新する |
+| `TWILIO_PHONE_NUMBER_SID` | — | 自動更新の対象にする電話番号（`PN…`） |
+| `PUBLIC_HOST` | — | 固定ホストで動かすとき（本番など）。`NGROK_ENABLED=false` で使用 |
+
+### Twilio / ブラウザ通話
+
+| 変数 | 既定 | 説明 |
+| --- | --- | --- |
+| `TWILIO_AUTH_TOKEN` | — | 設定すると `/twiml*` と WebSocket で `X-Twilio-Signature` を検証する。本番では必須 |
+| `TWILIO_API_KEY_SID` / `TWILIO_API_KEY_SECRET` / `TWILIO_TWIML_APP_SID` | — | 3 つ揃うとブラウザ通話（`/phone`）が有効になる。Voice URL の自動更新にも使う |
+| `BROWSER_PHONE_PASSCODE` | — | `/phone` からの発信に必要なパスコード（8 文字以上）。`NODE_ENV=production` では必須。未設定だと URL を知る人は誰でもあなたの Twilio 課金で発信できる |
+| `HANDOFF_PHONE_NUMBER` | — | 有人転送先（E.164）。未設定なら「おつなぎできません」と案内して終了 |
+| `HANDOFF_CALLER_ID` | — | 転送時の発信者番号。ブラウザ発信の `From` は電話番号ではないので、転送を使うなら所有する Twilio 番号を設定 |
+
+### 判定のしきい値
+
+| 変数 | 既定 | 説明 |
+| --- | --- | --- |
+| `CONFIDENCE_THRESHOLD` | `0.65` | 「何を求めているか分かる」確率がこれ未満なら聞き返す。Choice の採用基準にも使う |
+| `REQUIRES_HUMAN_THRESHOLD` | `0.7` | これ以上で有人転送 |
+| `SLOT_THRESHOLD` | `0.6` | 「今の発話は聞いていた答えか」の採用基準 |
+| `EMERGENCY_THRESHOLD` | `0.7` | これ以上で応急処置を先に案内し、日時を飛ばして最短受付 |
+| `MAX_CLARIFY_FAILURES` | `2` | 連続でこの回数聞き取れなければ有人転送 |
+| `TRIAGE_ADVICE` | `true` | 切り分け後に状況確認と一言アドバイスを挟む。`false` で定型文のみ |
+| `ADVICE_MAX_CHARS` / `FAQ_MAX_CHARS` | `60` / `100` | OpenAI が生成する文の上限文字数 |
+
+### 音声
+
+| 変数 | 既定 | 説明 |
+| --- | --- | --- |
+| `TTS_LANGUAGE` | `ja-JP` | |
+| `TTS_PROVIDER` / `TTS_VOICE` | `Google` / `ja-JP-Neural2-B` | Twilio 既定の音声は日本語の漢字を誤読することがあるため、日本語ネイティブの音声を推奨 |
+| `TRANSCRIPTION_PROVIDER` / `SPEECH_MODEL` | — | 空なら Twilio の既定 |
+
+## カスタマイズ
+
+コードを触らずに変えられるもの:
+
+| 変えたいこと | 場所 |
+| --- | --- |
+| **エラーコードと対処**（例: お風呂のリモコンの 111） | `src/errorCodes.json`。1 件 = `code` / `equipment` / `meaning` / `action` / `needsVisit`。追加して再起動。書式ミスは起動時と `npm test` で検出。初期の 3 件はサンプルなので、扱うメーカーの取扱説明書に合わせて書き換えてください |
+| **FAQ ナレッジ**（料金、営業時間、応急処置） | `src/mockKnowledge.json`。`category`（WATER / HEATER / DRAINAGE / REMODEL）と `equipment[]` で絞り込みに使われます。`equipment` が空なら全員向け（営業時間など） |
+| **しきい値** | `.env`（上記） |
+
+コードで変えるもの:
+
+| 変えたいこと | 場所 |
+| --- | --- |
+| 定型文（挨拶、聞き返し、復唱、緊急案内） | `src/config/messages.ts` |
+| 機器・症状の語彙と、(機器, 症状) → 業務カテゴリの変換表 | `src/config/serviceCatalog.ts` |
+| 状況確認の質問（機器・症状ごとに 1〜2 問） | `src/config/serviceCatalog.ts` の `detailQuestions` |
+| Jev に聞く質問文・判定基準 | `src/services/jevService.ts` |
+| OpenAI のプロンプト | `src/services/openAiService.ts` |
+| 会話の流れ（どのターンで何をするか） | `src/services/stateMachine.ts`（純粋関数） |
+| 受付の登録・照会（現在はモック） | `stateMachine.ts` の `fillSlot` で `visitDone` / `statusResult` を返している箇所 |
+
+エラーコードの検出は、音声認識が「一一一」「いちいちいち」のように漢字・かなで返しても数字に直して照合します。表にないコードは「登録なし」として LLM に渡すので、意味を推測せず「訪問時に確認します」と答えます。
 
 ## エンドポイント
 
 | パス | 用途 |
 | --- | --- |
-| `GET/POST /twiml` | `<Connect><ConversationRelay>` を返す初期 TwiML |
-| `WS /relay` | ConversationRelay セッション |
-| `POST /twiml/handoff` | `<Connect action>` コールバック。有人転送時は案内を `<Say>` して `<Dial>` |
+| `GET/POST /twiml` | Twilio が最初に取りに来る TwiML（`<Connect><ConversationRelay>`） |
+| `WS /relay` | ConversationRelay の WebSocket セッション |
+| `POST /twiml/handoff` | セッション終了時のコールバック。有人転送時は案内を `<Say>` して `<Dial>` |
 | `GET /health` | ヘルスチェック |
-| `GET /phone` | AI Call ボタンの画面（有効時のみ）。`?watch=<identity>` で他の通話のタイムラインだけ表示 |
-| `GET /phone/events` | 通話の進行を SSE で配信（`identity` ごと。画面の「会話の内訳」用） |
-| `POST /phone/token` | Voice SDK 用アクセストークン発行（有効時のみ） |
+| `GET /phone` | ブラウザ通話の画面（3 つの Twilio 設定が揃ったときのみ）。`?watch=<identity>` で他の通話のタイムラインだけ表示 |
+| `GET /phone/events` | 通話の進行を SSE で配信（画面の「会話の内訳」用） |
+| `POST /phone/token` | ブラウザ通話用のアクセストークン発行 |
 
-## ディレクトリ構成
+## ログの見方
 
-```
-src/
-├── config/
-│   ├── env.ts                 # zod による環境変数の検証
-│   ├── serviceCatalog.ts      # 機器・症状の語彙、(機器, 症状) → 業務カテゴリの変換表
-│   └── messages.ts            # 定型発話テンプレート（応急処置・復唱の文も）
-├── types/
-│   ├── conversation-relay.ts  # ConversationRelay の WebSocket メッセージ型 (zod)
-│   └── jev.ts                 # Jev API のリクエスト / レスポンス型 (zod)
-├── services/
-│   ├── jevService.ts          # Jev クライアント（undici keep-alive、期限付きリトライ、縮退）
-│   ├── openAiService.ts       # FAQ 回答生成（プロンプト、100文字クランプ）
-│   ├── slotExtraction.ts      # 日時・名前・住所・番号を発話から抜き出す
-│   ├── knowledgeSearch.ts     # ダミー RAG（文字 bigram + キーワード + カテゴリ/機器ボーナス）
-│   ├── errorCodes.ts          # 発話からエラーコードを拾い、表と照合して LLM に渡す
-│   ├── stateMachine.ts        # 純粋関数の状態遷移: (state, judgment) → (state, action)
-│   ├── tunnelService.ts       # ngrok トンネルの起動 / 停止
-│   └── twilioWebhookService.ts # TwiML App / 電話番号の Voice URL 更新
-├── handlers/relayHandler.ts   # WebSocket セッション処理
-├── routes/
-│   ├── twiml.ts               # /twiml, /twiml/handoff
-│   └── browserPhone.ts        # /phone, /phone/token（ブラウザ電話）
-├── utils/                     # X-Twilio-Signature 検証、Voice アクセストークン生成
-├── startup.ts                 # 公開ホストの決定 (ngrok / PUBLIC_HOST) と Twilio Webhook 同期
-├── server.ts                  # Fastify 組み立て（テスト用に DI 可能）
-├── index.ts                   # エントリーポイント
-├── mockKnowledge.json         # FAQ ダミーナレッジ
-└── errorCodes.json            # エラーコード表（編集して追加）
-public/phone.html              # ブラウザ電話の UI（Twilio Voice JS SDK）
-```
-
-## 設計メモ
-
-### ConversationRelay のメッセージ形式
-Twilio → サーバーの発話確定は `{"type":"prompt","voicePrompt":"…","last":true}` です。
-サーバー → Twilio の読み上げは **`{"type":"text","token":"…","last":true}`**（`prompt` ではありません）、
-終了・転送は `{"type":"end","handoffData":"…"}` です（[公式リファレンス](https://www.twilio.com/docs/voice/conversationrelay/websocket-messages)）。
-
-### Jev への質問
-`POST https://api.typesafe.ai/v1/systemone` に、毎ターン 3 つの質問を **1 リクエスト** で送ります（互いに独立なので並列評価される）。
-
-| id | 型 | 内容 |
-| --- | --- | --- |
-| `intent` | Choice | `TROUBLE`（不具合の相談・修理希望）/ `STATUS_CHECK` / `KNOWLEDGE_FAQ` / `HUMAN_HANDOFF` / `CLOSING` / `UNKNOWN` |
-| `is_confident` | Noul | どんな助けを求めているか分かるほど発話が明確か |
-| `requires_human` | Noul | 怒り・苦情・法的な話など有人対応が必要か（水の緊急事態は自動受付が扱うので含めない） |
-
-加えて、**会話の段階に応じた質問を同じリクエストに相乗り**させます（追加の往復なし）。
-
-| 段階 | 相乗りする質問 | コード側の処理 |
-| --- | --- | --- |
-| 用件待ち・切り分け中 | `equipment` Choice（蛇口 / キッチン / トイレ / お風呂 / 洗面台 / 給湯器 / 屋外排水 / ウォシュレット / 不明）、`symptom` Choice（水漏れ / 詰まり / 故障 / 交換 / 高圧洗浄 / 不明）、`is_emergency` Noul | `categoryOf(機器, 症状)` の表で 4 業務カテゴリに変換（`src/config/serviceCatalog.ts`）。片方だけ分かれば残りを聞く |
-| 状況確認中 | `answers_question` Noul（直前の質問への答えか） | 発話を整形してそのまま保持し、OpenAI に渡す |
-| 日時待ち | `provides_datetime` Noul | 発話から日時表現を正規表現で抜き出し |
-| 名前待ち | `provides_name` Noul | 前置き・語尾を除去 |
-| 住所待ち | `provides_address` Noul | 発話のまま保持（正規化はしない） |
-| 復唱への返事 | `confirmation` Choice (YES / NO / NEITHER) | — |
-
-Jev は「その発話が答えになっているか」「どの機器・症状か」を判定するだけで、値そのものは発話者の言葉からコードがコピーします（生成しない）。
-「トイレの水漏れ」＝水道、「トイレ本体の交換」＝リフォームのように、業務カテゴリは機器と症状の組み合わせで決まるため、Jev にカテゴリを直接選ばせず、コードの表で変換しています。
-
-受付フローは「切り分け → 状況確認 → 一言アドバイス → 日時 → 名前 → 住所 → 復唱して確認 → 完了」。切り分けが確定すると、コールセンターのようにまず状況を確認します（機器・症状ごとに 1〜2 問の定型文。`serviceCatalog.ts` の `detailQuestions`。答えは Jev の `answers_question` Noul で「質問への答えか」だけ判定し、発話のまま保持）。全部聞き終えたら「ありがとうございます。」を即時に流し、最初の申告と確認の答えをまとめて OpenAI に渡して一言（故障なら今すぐできる確認や応急処置、交換・高圧洗浄なら作業の概要や料金の目安）を約 1 秒で生成、続けて日時を尋ねます（`TRIAGE_ADVICE=false` で確認と一言を省き定型文のみに戻せます）。最初の発話で機器と症状が揃えば切り分けの質問は省略、緊急なら応急処置（水漏れは止水栓、詰まりは水を流さない、給湯器はガスの元栓）を先に案内して日時を飛ばし「できるだけ早く」で受付、復唱を否定されたら日時から取り直し、途中の FAQ には答えたうえで聞きかけの質問に戻ります。受付の登録・照会そのものはモックです（`stateMachine.ts` の `fillSlot`）。
-
-`state` には最新の発話 `latest_caller_utterance` と直近の会話 `recent_turns` を渡し、「トイレです」のような短い答えも文脈で判定できるようにしています。
-実測トークン: 切り分けターン（7 問）約 2,000、聞き取りターン（4 問）約 1,100（入力のみ課金、$0.042/M）。
-しきい値 (`0.65` / `0.7` / `0.6` / `0.7`) は本物の Jev でのシミュレーションで決めた出発点です。通話ログで評価して調整してください。
-
-### エラーコード表 (`src/errorCodes.json`)
-お客様が口にした機器のエラーコード（例: お風呂のリモコンの「111」）の意味と対処を OpenAI に渡すための表です。**コードを触らずに JSON を編集するだけ**で追加・修正できます（再起動で反映。書式ミスは起動時と `npm test` で検出）。
-
-```json
-{
-  "code": "111",
-  "equipment": "WATER_HEATER",
-  "meaning": "点火不良（お湯を沸かす火がつかない）",
-  "action": "ガスの元栓が開いているか、ガスメーターが遮断されていないかを確認し、お風呂のリモコンの運転を一度切って入れ直してください。",
-  "needsVisit": "再発する場合は点検が必要です。"
-}
-```
-
-- `code`: 数字 1〜4 桁、または英字 1 文字＋数字（`111`, `E1`）。音声認識が「一一一」「いちいちいち」「いち、よん、ぜろ」のように漢字・かなで返しても、数字に直してから照合します（かなは 3 語以上続いたときだけ変換するので「に」「ご」のような助詞は誤変換しません）
-- `equipment`: `serviceCatalog.ts` の機器 ID（`WATER_HEATER`, `TOILET` …）
-- `meaning` / `action` / `needsVisit`: そのまま LLM の根拠になります。読み上げ前提で短く、断定してよい内容だけを書いてください
-- 発話に含まれる 3〜4 桁の数字はすべて照合し、**表にないコードは「登録なし」として渡す**ので、LLM は意味を推測せず「訪問時に確認します」と答えます。コードが 1 つも拾えなかったときは、番号の復唱・意味の推測・「お伺いします」という約束をしないよう指示しています
-- 一言アドバイスでは「お伺いします」という言葉を LLM に使わせません。直後にシステムが「点検と修理にお伺いします」と続けるため、混ざると意味が取れなくなるからです
-- 初期の 3 件（111 / 140 / 888）は一般的な給湯器の表示をもとにした**サンプル**です。実際に扱うメーカーの取扱説明書に合わせて書き換えてください
-
-### ナレッジ (`src/mockKnowledge.json`)
-各エントリに `category`（4 業務カテゴリ）と `equipment[]`（対象機器、空なら営業時間などの共通項目）を持たせています。FAQ 回答時は Jev の切り分け結果でカテゴリ・機器が一致するエントリを優先し（フィルタではなくボーナス）、プロンプトに「お客様の状況: 水道の修理: トイレの詰まり」を添えるので、「止水栓はどこ」に対してトイレならタンク横、キッチンならシンク下、と状況に合った答えになります。
-
-### 信頼性
-- **Jev 障害時は縮退**: タイムアウト (`JEV_TIMEOUT_MS`、リトライ込みの総期限) / 5xx / 429 / 529 / スキーマ不一致は例外にせず `UNKNOWN` 判定として返し、聞き返し → 有人転送の通常フローに乗せます。
-- **OpenAI 障害時**: FAQ 回答は謝罪テンプレートを返し、切り分け後の一言アドバイスは何も言わずに日時の質問へ進みます。どちらも通話は継続します。
-- **古い結果の破棄**: ターン番号で管理し、Jev / OpenAI の応答待ち中に新しい発話が来たら古い結果は捨てます。FAQ 生成は `AbortController` で中断します。
-- **相槌の保護**: クッション発話中の「はい」など `FAQ_BARGE_IN_MIN_CHARS` 未満の発話では FAQ 生成を中断しません。
-- **転送案内は TwiML 側で発話**: `end` を送るとリレーが即終了し直前のテキストが途切れ得るため、案内文は `handoffData` に載せ `/twiml/handoff` の `<Say>` で読み上げてから `<Dial>` します。
-- **WebSocket 異常終了時**（`SessionStatus=failed`）も `/twiml/handoff` で有人転送にフォールバックします。
-- DTMF `0` でいつでもオペレーター転送。
-
-### セキュリティ
-- `TWILIO_AUTH_TOKEN` を設定すると `/twiml*` と WebSocket アップグレードで `X-Twilio-Signature` を検証します（本番では必須）。
-- 全エンドポイントに IP 単位のレート制限、WebSocket は 64 KB のペイロード上限。
-- 各ターンの文字起こしは `turn decided` ログの `utterance` に `info` レベルで出ます（判定の調整・デバッグ用）。個人情報を含み得るので、本番ではログの保管先と保持期間に注意するか、`LOG_LEVEL=warn` にしてください。
-- ブラウザ通話のトークン発行 `/phone/token` は `BROWSER_PHONE_PASSCODE` で保護できます（`NODE_ENV=production` では必須）。
-
-### ログの見方
 `npm run dev` の標準出力に JSON で 1 行ずつ出ます（`npm run dev > .logs/server.log 2>&1` のようにリダイレクトすると後から見返せます。`.logs/` は gitignore 済み）。1 ターンごとの主なフィールド:
 
 | フィールド | 意味 |
@@ -221,18 +255,74 @@ Jev は「その発話が答えになっているか」「どの機器・症状�
 | `intent` / `intentConfidence` / `isConfident` / `requiresHuman` | 毎ターンの 3 判定 |
 | `triage.equipment` / `triage.symptom` / `triage.emergency` | 切り分けターンの判定と確信度 |
 | `expecting` / `provides` / `confirmation` | 待っていた答えの種類と、答えになっていた確率 |
-| `jevMs` | Jev の応答時間。`degraded: true` なら Jev に届かず縮退判定 |
+| `jevMs` | Jev の応答時間。`degraded: true` なら Jev に届かず縮退判定（聞き返しになる） |
 | `action` | `say`（定型文）/ `faq`（OpenAI を挟む）/ `handoff` |
 | `deep path spoken` 行の `purpose` / `openAiMs` / `knowledgeIds` | OpenAI の用途（`answer` / `advice`）、所要時間、根拠にしたナレッジ |
 
-同じ内容はブラウザ通話の画面右「会話の内訳」でも、ターンごとに Jev / OpenAI のバッジと時間付きで見られます。
+同じ内容はブラウザ通話の画面右「会話の内訳」でも見られます。文字起こしを含むため、本番ではログの保管先と保持期間に注意するか `LOG_LEVEL=warn` にしてください。
 
-## 本番化に向けて
-- 訪問受付の登録・照会はモックです（実際の受付システムには登録していません）。`stateMachine.ts` は純粋関数のままにして、`visitDone` を返すアクションからリポジトリを呼ぶ形で接続してください。
-- 日時・住所は発話者の言葉のまま保持しています（「明日の3時」「世田谷区桜丘1丁目2の3」）。登録には日付への正規化、午前/午後の確認、住所の正規化が必要です。電話番号は PSTN 着信なら `From` を使えます。
-- 緊急判定は `is_emergency` の Noul（既定 0.7）だけで決めています。通常の「水漏れしてて」でも 0.5〜0.6 が出るので、しきい値を下げる場合は実通話で確認してください。
-- 音声は `TTS_PROVIDER=Google` / `TTS_VOICE=ja-JP-Neural2-B` を推奨値にしています。Twilio 既定 (ElevenLabs) は日本語の漢字を誤読することがありました。定型文も誤読されやすい漢字（受付・承る・日時）を避けています。
-- 一言アドバイスは `ADVICE_MAX_CHARS`（既定 60）で長さを抑えていますが、LLM が確認済みの内容を聞き直すなど、プロンプトの指示を守らないことがまれにあります。目立つ場合は、確認の答えごとに定型文を用意する方式への切り替えを検討してください。
-- エラーコード表 `src/errorCodes.json` の 3 件はサンプルです。運用前に、扱うメーカーの取扱説明書に合わせて書き換えてください。
-- `knowledgeSearch.ts` はダミー実装です。`searchKnowledge` の戻り値の形を保ったままベクトル検索等に差し替えてください。
-- 複数インスタンスで運用する場合、レート制限ストアを Redis に切り替えてください（セッション状態は WebSocket 接続に紐づくため共有不要）。
+## トラブルシューティング
+
+| 症状 | 確認すること |
+| --- | --- |
+| 起動時に `Invalid environment configuration` | メッセージに足りない変数が列挙されます。`NGROK_ENABLED=true` なら `NGROK_AUTHTOKEN`、`false` なら `PUBLIC_HOST` が必要。ブラウザ通話の 3 変数は全部揃えるか全部空に |
+| `Could not start the ngrok tunnel … ERR_NGROK_105` | authtoken が違います。ダッシュボードの値をそのまま貼ってください |
+| `Twilio voice webhook update FAILED` | API キーか TwiML App SID が違います。サーバーは起動しているので、ログの `voiceUrl` を Console で手動設定しても動きます |
+| つながった直後に切れる | ConversationRelay の利用同意（Addendum）が未了。Console → Voice → Settings → General |
+| `/twiml` が 403 | `TWILIO_AUTH_TOKEN` が Twilio の実際の Auth Token と違う、または `PUBLIC_HOST` と Twilio がアクセスした URL が食い違っている（署名は URL 全体で計算されます） |
+| 「音声ストリームを取得できず…」 | 古い版のメッセージです。現在は Voice SDK の音量イベントで計測するので、最新のコードでは出ません |
+| 体感待ち時間が出ない / おかしい | スピーカーだと AI の声をマイクが拾います。ヘッドホンで試してください |
+| 読み上げが変（漢字の誤読） | `TTS_PROVIDER=Google` / `TTS_VOICE=ja-JP-Neural2-B` になっているか確認 |
+| Jev が `degraded: true` ばかり | `TYPESAFE_API_KEY` を確認。一時的な 503 なら 1 回リトライした上で聞き返しに落ちます |
+
+## ディレクトリ構成
+
+```
+src/
+├── config/
+│   ├── env.ts                 # 環境変数の検証（zod）
+│   ├── serviceCatalog.ts      # 機器・症状の語彙、(機器, 症状) → 業務カテゴリ、状況確認の質問
+│   └── messages.ts            # 定型文
+├── types/
+│   ├── conversation-relay.ts  # ConversationRelay の WebSocket メッセージ型
+│   └── jev.ts                 # Jev API のリクエスト / レスポンス型
+├── services/
+│   ├── jevService.ts          # Jev クライアント（1 ターン 1 リクエスト、期限付きリトライ、縮退）
+│   ├── openAiService.ts       # FAQ 回答と一言アドバイスの生成
+│   ├── knowledgeSearch.ts     # ナレッジ検索（文字 bigram + キーワード + カテゴリ/機器ボーナス）
+│   ├── errorCodes.ts          # 発話からエラーコードを拾い、表と照合して LLM に渡す
+│   ├── slotExtraction.ts      # 日時・名前・住所・番号を発話から抜き出す
+│   ├── stateMachine.ts        # 会話の状態遷移（純粋関数）: (state, 判定) → (state, アクション)
+│   ├── callEvents.ts          # ブラウザ画面向けのターンイベント
+│   ├── tunnelService.ts       # ngrok トンネルの起動 / 停止
+│   └── twilioWebhookService.ts # TwiML App / 電話番号の Voice URL 更新
+├── handlers/relayHandler.ts   # WebSocket セッション処理（cushion → OpenAI → followUp、割り込み）
+├── routes/
+│   ├── twiml.ts               # /twiml, /twiml/handoff
+│   └── browserPhone.ts        # /phone, /phone/token, /phone/events
+├── utils/                     # X-Twilio-Signature 検証、Voice アクセストークン生成
+├── startup.ts                 # 公開ホストの決定と Twilio Webhook 同期
+├── server.ts                  # Fastify の組み立て
+├── index.ts                   # エントリーポイント
+├── mockKnowledge.json         # FAQ ナレッジ（編集可）
+└── errorCodes.json            # エラーコード表（編集可）
+public/phone.html              # ブラウザ通話の画面（Twilio Voice JS SDK）
+tests/                         # Vitest（外部 API はモック）
+```
+
+| コマンド | 内容 |
+| --- | --- |
+| `npm run dev` | 開発起動（tsx watch） |
+| `npm run build` / `npm start` | `dist/` にビルドして起動 |
+| `npm test` / `npm run test:coverage` | テスト（カバレッジ閾値 80%） |
+| `npm run typecheck` | 型チェックのみ |
+
+## 本番で動かす前に
+
+- **公開ホスト**: `NGROK_ENABLED=false` にして `PUBLIC_HOST` に固定ホスト名を設定し、Twilio Console で電話番号の Voice URL を `https://<PUBLIC_HOST>/twiml` に設定してください。
+- **署名検証**: `TWILIO_AUTH_TOKEN` を必ず設定してください（Twilio 以外からのリクエストを拒否します）。
+- **ブラウザ通話**: 公開するなら `BROWSER_PHONE_PASSCODE` を設定してください（`NODE_ENV=production` では起動時に必須チェックされます）。
+- **受付の登録**: 現在はモックです。`stateMachine.ts` は純粋関数のままにして、`visitDone` を返すアクションを受け取った側（`relayHandler.ts`）から予約システムを呼ぶ形で接続してください。日時・住所は発話のまま保持しているので（「明日の3時」「世田谷区…」）、登録には正規化が必要です。
+- **ナレッジ検索**: `knowledgeSearch.ts` は簡易実装です。`searchKnowledge` の戻り値の形を保てば、ベクトル検索などに差し替えられます。
+- **しきい値**: 既定値は本物の Jev でのシミュレーションから決めた出発点です。通話ログの `utterance` と判定値を見て調整してください。
+- **複数インスタンス**: セッション状態は WebSocket 接続に紐づくため共有不要ですが、レート制限のストアは Redis などに切り替えてください。
