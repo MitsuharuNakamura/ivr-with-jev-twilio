@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>AI Call</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --card: #ffffff; --text: #16181d; --muted: #667085; --line: #e3e6ec;
+    --call: #12855a; --hangup: #c8352f; --key: #eef0f4; --accent: #2a5bd7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f1115; --card: #181b22; --text: #eceef2; --muted: #98a2b3; --line: #2a2f3a; --key: #232833; --accent: #7aa2ff; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: start center; padding: 16px;
+    background: var(--bg); color: var(--text); font: 16px/1.6 system-ui, "Hiragino Sans", "Noto Sans JP", sans-serif; }
+  main { flex: 0 0 360px; max-width: 360px; width: 100%; background: var(--card); border: 1px solid var(--line); border-radius: 20px; padding: 24px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin: 0 0 20px; }
+  .status { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; margin-bottom: 16px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot[data-state="connecting"] { background: #d99a1c; animation: pulse 1s infinite; }
+  .dot[data-state="live"] { background: var(--call); }
+  .dot[data-state="error"] { background: var(--hangup); }
+  @keyframes pulse { 50% { opacity: .35; } }
+  #timer { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--muted); }
+  label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+  input { width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: transparent; color: inherit; font: inherit; margin-bottom: 16px; }
+  button { font: inherit; border: 0; border-radius: 12px; cursor: pointer; color: inherit; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .primary { width: 100%; padding: 18px; font-weight: 600; font-size: 17px; color: #fff; background: var(--call);
+    display: flex; align-items: center; justify-content: center; gap: 10px; border-radius: 999px; }
+  .primary[data-live="true"] { background: var(--hangup); }
+  .row { display: flex; gap: 8px; margin-top: 12px; }
+  .row button { flex: 1; padding: 10px; background: var(--key); font-size: 14px; }
+  .row button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+  #log { margin: 16px 0 0; padding: 0; list-style: none; font-size: 12px; color: var(--muted); max-height: 120px; overflow: auto; }
+  .layout { display: flex; gap: 16px; align-items: flex-start; justify-content: center; flex-wrap: wrap; width: 100%; max-width: 900px; }
+  .panel { flex: 1 1 420px; background: var(--card); border: 1px solid var(--line); border-radius: 20px; padding: 24px; }
+  .panel h2 { font-size: 15px; margin: 0 0 12px; }
+  .legend { display: flex; gap: 12px; font-size: 12px; color: var(--muted); margin-bottom: 12px; flex-wrap: wrap; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; line-height: 1.6; }
+  .badge.jev { background: #e551ba22; color: #b8388f; }
+  .badge.openai { background: #10a37f22; color: #0b7a5f; }
+  .badge.end { background: #c8352f22; color: #a52a25; }
+  @media (prefers-color-scheme: dark) { .badge.jev { color: #f08ad3; } .badge.openai { color: #4fd1a8; } .badge.end { color: #f08a86; } }
+  #timeline { list-style: none; margin: 0; padding: 0; max-height: 60vh; overflow: auto; font-size: 14px; }
+  #timeline li { padding: 10px 0; border-top: 1px solid var(--line); }
+  #timeline li.caller { color: var(--muted); }
+  #timeline .who { font-size: 11px; color: var(--muted); margin-bottom: 2px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  #timeline .stats { font-size: 12px; color: var(--muted); margin-top: 4px; font-variant-numeric: tabular-nums; }
+  #timeline .stats b { color: var(--text); font-weight: 600; }
+  .empty { color: var(--muted); font-size: 13px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div class="layout">
+<main>
+  <h1>AI Call</h1>
+  <p class="sub">ボタンを押すと、マイクで AI とそのまま通話できます。</p>
+
+  <div class="status" role="status" aria-live="polite">
+    <span class="dot" id="dot" data-state="idle"></span>
+    <span id="statusText">待機中</span>
+    <span id="timer"></span>
+  </div>
+
+  <div id="passcodeField" hidden>
+    <label for="passcode">パスコード</label>
+    <input id="passcode" type="password" autocomplete="off">
+  </div>
+
+  <button class="primary" id="callButton" data-live="false">
+    <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M6.6 10.8a15.1 15.1 0 0 0 6.6 6.6l2.2-2.2a1 1 0 0 1 1-.25 11.4 11.4 0 0 0 3.6.57 1 1 0 0 1 1 1V20a1 1 0 0 1-1 1A17 17 0 0 1 3 4a1 1 0 0 1 1-1h3.5a1 1 0 0 1 1 1c0 1.25.2 2.45.57 3.57a1 1 0 0 1-.25 1z"/></svg>
+    <span id="callLabel">AI と通話する</span>
+  </button>
+
+  <div class="row" id="inCall" hidden>
+    <button id="muteButton" aria-pressed="false">ミュート</button>
+    <button id="operatorButton">オペレーターへ</button>
+  </div>
+
+  <ul id="log" aria-label="ログ"></ul>
+</main>
+
+<section class="panel" aria-label="会話の内訳">
+  <h2>会話の内訳</h2>
+  <div class="legend">
+    <span><span class="badge jev">Jev</span> 判定＋定型文（LLM なし）</span>
+    <span><span class="badge openai">Jev + OpenAI</span> LLM が文章を生成</span>
+  </div>
+  <p class="empty" id="timelineEmpty">通話を始めると、ターンごとに「誰が答えたか」と待ち時間がここに出ます。</p>
+  <ol id="timeline"></ol>
+  <p class="empty" style="margin-top:12px">待ち時間の「体感」は、このブラウザのマイクが静かになってから受話音声が始まるまでを測った目安です（ヘッドホン推奨。スピーカーだと AI の声をマイクが拾って崩れます）。「サーバー」は文字起こしを受け取ってから返答を送るまでで、Twilio 側の音声認識・音声合成の時間は含みません。</p>
+</section>
+</div>
+
+<script src="/phone/sdk.js"></script>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const el = {
+    dot: $('dot'), status: $('statusText'), timer: $('timer'), call: $('callButton'), callLabel: $('callLabel'),
+    inCall: $('inCall'), mute: $('muteButton'), operator: $('operatorButton'), log: $('log'),
+    passcodeField: $('passcodeField'), passcode: $('passcode'),
+    timeline: $('timeline'), timelineEmpty: $('timelineEmpty'),
+  };
+  let eventSource = null;
+  let latencyMeter = null;
+  // The IVR hands off to a human operator on DTMF 0.
+  const OPERATOR_DIGIT = '0';
+  let device = null;
+  let call = null;
+  let timerId = null;
+
+  function log(message) {
+    const item = document.createElement('li');
+    item.textContent = `${new Date().toLocaleTimeString('ja-JP')}  ${message}`;
+    el.log.prepend(item);
+  }
+
+  function setStatus(state, text) {
+    el.dot.dataset.state = state;
+    el.status.textContent = text;
+  }
+
+  function setLive(live) {
+    el.call.dataset.live = String(live);
+    el.callLabel.textContent = live ? '通話を終了' : 'AI と通話する';
+    el.inCall.hidden = !live;
+    if (!live) {
+      el.mute.setAttribute('aria-pressed', 'false');
+      el.mute.textContent = 'ミュート';
+    }
+  }
+
+  function startTimer() {
+    const startedAt = Date.now();
+    timerId = setInterval(() => {
+      const sec = Math.floor((Date.now() - startedAt) / 1000);
+      el.timer.textContent = `${String(Math.floor(sec / 60)).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')}`;
+    }, 500);
+  }
+
+  function stopTimer() {
+    clearInterval(timerId);
+    timerId = null;
+    el.timer.textContent = '';
+  }
+
+  async function fetchToken() {
+    const response = await fetch('/phone/token', {
+      method: 'POST',
+      headers: el.passcode.value ? { 'x-phone-passcode': el.passcode.value } : {},
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || !body.success) {
+      throw new Error(body.error || `トークンを取得できませんでした (${response.status})`);
+    }
+    return body.data;
+  }
+
+  // ---------- Timeline (server events) ----------
+  const fmt = (ms) => (ms === undefined || ms === null ? '—' : `${(ms / 1000).toFixed(2)}s`);
+  const LABEL = {
+    intent: { TROUBLE: '修理の相談', STATUS_CHECK: '受付の確認', KNOWLEDGE_FAQ: '質問', HUMAN_HANDOFF: '有人希望', CLOSING: '終話', UNKNOWN: '判定不能' },
+    category: { WATER: '水道', HEATER: '給湯器', DRAINAGE: '排水・下水', REMODEL: 'リフォーム' },
+    equipment: { FAUCET: '蛇口', KITCHEN: 'キッチン', TOILET: 'トイレ', BATH: 'お風呂', WASHSTAND: '洗面台', WATER_HEATER: '給湯器', OUTDOOR_DRAIN: '屋外排水', WASHLET: 'ウォシュレット' },
+    symptom: { LEAK: '水漏れ', CLOG: '詰まり', BREAKDOWN: '故障', REPLACE: '交換', CLEANING: '高圧洗浄' },
+  };
+  let lastAgentItem = null;
+
+  function addTimelineItem(event) {
+    el.timelineEmpty.hidden = true;
+    const item = document.createElement('li');
+    item.className = event.type;
+    const who = document.createElement('div');
+    who.className = 'who';
+    const text = document.createElement('div');
+    text.textContent = event.text;
+
+    if (event.type === 'caller') {
+      who.textContent = `お客様 · ターン ${event.turn}`;
+    } else {
+      const badge = document.createElement('span');
+      if (event.type === 'end') { badge.className = 'badge end'; badge.textContent = `終了: ${event.reason}`; }
+      else if (event.source === 'openai') { badge.className = 'badge openai'; badge.textContent = 'Jev + OpenAI'; }
+      else { badge.className = 'badge jev'; badge.textContent = 'Jev'; }
+      who.append('AI · ', badge);
+      const judged = [
+        event.intent && LABEL.intent[event.intent],
+        event.category && LABEL.category[event.category],
+        event.equipment && event.symptom && `${LABEL.equipment[event.equipment]}の${LABEL.symptom[event.symptom]}`,
+        event.emergency !== undefined && event.emergency >= 0.7 && '緊急',
+        event.degraded && 'Jev 応答なし',
+      ].filter(Boolean).join(' / ');
+      if (judged) who.append(` ${judged}`);
+
+      const stats = document.createElement('div');
+      stats.className = 'stats';
+      const parts = [`サーバー <b>${fmt(event.elapsedMs)}</b>`];
+      if (event.jevMs !== undefined) parts.push(`Jev ${fmt(event.jevMs)}`);
+      if (event.openAiMs !== undefined) parts.push(`OpenAI ${fmt(event.openAiMs)}`);
+      stats.innerHTML = parts.join(' · ');
+      stats.dataset.turn = String(event.turn);
+      item.append(who, text, stats);
+      lastAgentItem = { stats, at: performance.now() };
+      el.timeline.append(item);
+      el.timeline.scrollTop = el.timeline.scrollHeight;
+      return;
+    }
+    item.append(who, text);
+    el.timeline.append(item);
+    el.timeline.scrollTop = el.timeline.scrollHeight;
+  }
+
+  function openEvents(identity) {
+    closeEvents();
+    eventSource = new EventSource(`/phone/events?identity=${encodeURIComponent(identity)}`);
+    eventSource.onmessage = (message) => {
+      try { addTimelineItem(JSON.parse(message.data)); } catch (error) { log(`イベントの解析に失敗: ${error.message}`); }
+    };
+    eventSource.onerror = () => log('サーバーからのイベント接続が切れました');
+  }
+
+  function closeEvents() {
+    if (eventSource) { eventSource.close(); eventSource = null; }
+  }
+
+  // ---------- Perceived latency: my mic goes quiet -> the AI's voice starts ----------
+  // Uses the Voice SDK's `volume` event (input/output level 0..1 every 50 ms), so no
+  // WebAudio taps are needed. Thresholds adapt to each side's noise floor.
+  const SILENCE_MS = 500;
+  const MIN_THRESHOLD = 0.03;
+  const FLOOR_MULTIPLIER = 4;
+
+  function createLatencyMeter(activeCall) {
+    let localSpeaking = false; let localQuietSince = 0; let callerEndedAt = null;
+    let remoteSpeaking = false; let remoteQuietSince = 0;
+    let localFloor = 0.005; let remoteFloor = 0.005;
+    const above = (level, floor) => level > Math.max(MIN_THRESHOLD, floor * FLOOR_MULTIPLIER);
+    const settle = (floor, level) => floor * 0.95 + level * 0.05;
+
+    function onRemoteStarted(now) {
+      if (callerEndedAt === null) return;
+      const perceived = now - callerEndedAt;
+      callerEndedAt = null;
+      if (lastAgentItem && !lastAgentItem.stats.dataset.perceived) {
+        lastAgentItem.stats.dataset.perceived = '1';
+        lastAgentItem.stats.innerHTML = `体感 <b>${fmt(perceived)}</b> · ${lastAgentItem.stats.innerHTML}`;
+      }
+      log(`体感待ち時間 ${fmt(perceived)}`);
+    }
+
+    function onVolume(inputLevel, outputLevel) {
+      const now = performance.now();
+      const remote = above(outputLevel, remoteFloor);
+      // While the AI is talking the mic mostly hears its echo, so the caller side is ignored then.
+      const local = !remoteSpeaking && above(inputLevel, localFloor);
+      if (!remote) remoteFloor = settle(remoteFloor, outputLevel);
+      if (!local) localFloor = settle(localFloor, inputLevel);
+
+      if (remote) {
+        remoteQuietSince = 0;
+        if (!remoteSpeaking) { remoteSpeaking = true; onRemoteStarted(now); }
+      } else if (remoteSpeaking) {
+        if (!remoteQuietSince) remoteQuietSince = now;
+        else if (now - remoteQuietSince >= SILENCE_MS) { remoteSpeaking = false; remoteQuietSince = 0; }
+      }
+
+      if (local) { localSpeaking = true; localQuietSince = 0; }
+      else if (localSpeaking) {
+        if (!localQuietSince) localQuietSince = now;
+        else if (now - localQuietSince >= SILENCE_MS) { localSpeaking = false; callerEndedAt = localQuietSince; localQuietSince = 0; }
+      }
+    }
+
+    activeCall.on('volume', onVolume);
+    return { stop() { activeCall.removeListener('volume', onVolume); } };
+  }
+
+  function startLatencyMeter() {
+    try {
+      latencyMeter = createLatencyMeter(call);
+      log('体感待ち時間の計測を開始しました');
+    } catch (error) {
+      log(`体感待ち時間の計測を開始できません: ${error.message}`);
+    }
+  }
+
+  function stopLatencyMeter() {
+    if (latencyMeter) { latencyMeter.stop(); latencyMeter = null; }
+  }
+
+  function onCallEnded(reason) {
+    closeEvents();
+    stopLatencyMeter();
+    call = null;
+    stopTimer();
+    setLive(false);
+    setStatus('idle', '待機中');
+    log(reason);
+    if (device) {
+      device.destroy();
+      device = null;
+    }
+  }
+
+  async function startCall() {
+    el.call.disabled = true;
+    setStatus('connecting', '接続中…');
+    try {
+      const { token, identity } = await fetchToken();
+      device = new Twilio.Device(token, { codecPreferences: ['opus', 'pcmu'], closeProtection: true });
+      device.on('error', (error) => log(`デバイスエラー: ${error.message}`));
+      device.on('tokenWillExpire', async () => {
+        try {
+          device.updateToken((await fetchToken()).token);
+        } catch (error) {
+          log(`トークン更新に失敗: ${error.message}`);
+        }
+      });
+
+      el.timeline.replaceChildren();
+      el.timelineEmpty.hidden = false;
+      lastAgentItem = null;
+      openEvents(identity);
+      call = await device.connect({ params: { source: 'browser-phone', identity } });
+      log(`AI に接続しています (${identity})`);
+      setLive(true);
+      call.on('accept', () => { setStatus('live', '通話中'); startTimer(); startLatencyMeter(); });
+      call.on('disconnect', () => onCallEnded('通話が終了しました'));
+      call.on('cancel', () => onCallEnded('接続がキャンセルされました'));
+      call.on('error', (error) => { setStatus('error', 'エラー'); log(`通話エラー: ${error.message}`); });
+    } catch (error) {
+      setStatus('error', '接続できません');
+      closeEvents();
+      log(error.message);
+      if (device) {
+        device.destroy();
+        device = null;
+      }
+      setLive(false);
+    } finally {
+      el.call.disabled = false;
+    }
+  }
+
+  el.call.addEventListener('click', () => {
+    if (call) call.disconnect();
+    else startCall();
+  });
+
+  el.mute.addEventListener('click', () => {
+    if (!call) return;
+    const muted = !call.isMuted();
+    call.mute(muted);
+    el.mute.setAttribute('aria-pressed', String(muted));
+    el.mute.textContent = muted ? 'ミュート中' : 'ミュート';
+  });
+
+  el.operator.addEventListener('click', () => {
+    if (!call) return;
+    call.sendDigits(OPERATOR_DIGIT);
+    log('オペレーターへの転送を依頼しました');
+  });
+
+  // ?watch=<identity> follows another call's timeline without placing one (useful when testing).
+  const watching = new URLSearchParams(location.search).get('watch');
+  if (watching) {
+    openEvents(watching);
+    log(`${watching} の会話を表示しています`);
+  }
+
+  fetch('/phone/config')
+    .then((response) => response.json())
+    .then((body) => { el.passcodeField.hidden = !(body.data && body.data.passcodeRequired); })
+    .catch(() => log('設定を取得できませんでした'));
+
+  if (!window.Twilio || !navigator.mediaDevices) {
+    setStatus('error', 'このブラウザでは利用できません');
+    el.call.disabled = true;
+    log('HTTPS (または localhost) でアクセスしてください');
+  }
+})();
+</script>
+</body>
+</html>
